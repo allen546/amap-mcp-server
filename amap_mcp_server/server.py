@@ -1,895 +1,357 @@
 import os
-import sys
 import argparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import requests
 from mcp.server.fastmcp import FastMCP
 
-def get_api_key() -> str:
-    """Get the Amap Maps API key from environment variables"""
-    api_key = os.getenv("AMAP_MAPS_API_KEY")
-    if not api_key:
-        raise ValueError("AMAP_MAPS_API_KEY environment variable is required")
-    return api_key
-
-AMAP_MAPS_API_KEY = get_api_key()
+AMAP_MAPS_API_KEY = os.getenv("AMAP_MAPS_API_KEY")
+if not AMAP_MAPS_API_KEY:
+    raise ValueError("AMAP_MAPS_API_KEY environment variable is required")
 
 mcp = FastMCP("amap-maps")
 
-@mcp.tool()
-def maps_regeocode(location: str) -> Dict[str, Any]:
-    """将一个高德经纬度坐标转换为行政区划地址信息"""
+
+# ── internal helpers (not exposed as tools) ──────────────────────────
+
+def _geocode(address: str, city: Optional[str] = None) -> Dict[str, Any]:
+    """Geocode a Chinese address to lon,lat. Returns {"location": "lng,lat", "formatted_address": "..."} or {"error": "..."}."""
+    params = {"key": AMAP_MAPS_API_KEY, "address": address}
+    if city:
+        params["city"] = city
+    resp = requests.get("https://restapi.amap.com/v3/geocode/geo", params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    if data["status"] != "1":
+        info = data.get("info") or data.get("infocode")
+        hint = ""
+        if info == "ENGINE_RESPONSE_DATA_ERROR":
+            hint = " (hint: address and city must be in Chinese)"
+        return {"error": f"Geocoding '{address}' (city={city}) failed: {info}{hint}"}
+    geocodes = data.get("geocodes", [])
+    if not geocodes:
+        return {"error": f"No results for address '{address}'"}
+    return {
+        "location": geocodes[0].get("location"),
+        "formatted_address": geocodes[0].get("formatted_address"),
+    }
+
+
+def _geocode_pair(origin_address, destination_address, origin_city=None, destination_city=None):
+    """Geocode origin + destination. Returns (origin_loc, dest_loc, addresses_dict) or a dict with 'error'."""
+    o = _geocode(origin_address, origin_city)
+    if "error" in o:
+        return {"error": f"Origin: {o['error']}"}
+    d = _geocode(destination_address, destination_city)
+    if "error" in d:
+        return {"error": f"Destination: {d['error']}"}
+    addresses = {
+        "origin": {"address": origin_address, "resolved": o["formatted_address"], "coordinates": o["location"]},
+        "destination": {"address": destination_address, "resolved": d["formatted_address"], "coordinates": d["location"]},
+    }
+    return o["location"], d["location"], addresses
+
+
+def _duration_str(seconds) -> str:
+    """Convert seconds (str or int) to human-readable string."""
     try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/geocode/regeo",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "location": location
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
+        m = int(seconds) // 60
+        return f"{m} minutes"
+    except (TypeError, ValueError):
+        return str(seconds)
 
-        if data["status"] != "1":
-            return {"error": f"RGeocoding failed: {data.get('info') or data.get('infocode')}"}
 
-        return {
-            "province": data["regeocode"]["addressComponent"]["province"],
-            "city": data["regeocode"]["addressComponent"]["city"],
-            "district": data["regeocode"]["addressComponent"]["district"]
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
+# ── routing tools ────────────────────────────────────────────────────
 
 @mcp.tool()
-def maps_geo(address: str, city: Optional[str] = None) -> Dict[str, Any]:
-    """将详细的结构化地址转换为经纬度坐标。支持对地标性名胜景区、建筑物名称解析为经纬度坐标
+def route_transit(origin: str, destination: str, city: str = "北京") -> Dict[str, Any]:
+    """Plan a public transit route (subway, bus, train) between two places.
 
-    IMPORTANT: Both address and city MUST be in Chinese (中文). The Amap API does not
-    reliably support English input. English addresses will produce wrong results or errors.
-    Example: address="团结湖地铁站", city="北京"
-    """
-    try:
-        params = {
-            "key": AMAP_MAPS_API_KEY,
-            "address": address
-        }
-        if city:
-            params["city"] = city
-
-        response = requests.get(
-            "https://restapi.amap.com/v3/geocode/geo",
-            params=params
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data["status"] != "1":
-            error_info = data.get('info') or data.get('infocode')
-            hint = ""
-            if error_info == "ENGINE_RESPONSE_DATA_ERROR":
-                hint = " (hint: ensure both address and city are in Chinese, e.g. address='团结湖地铁站', city='北京')"
-            return {"error": f"Geocoding failed for address '{address}' (city={city}): {error_info}{hint}"}
-
-        geocodes = data.get("geocodes", [])
-        results = []
-        for geo in geocodes:
-            results.append({
-                "formatted_address": geo.get("formatted_address"),
-                "country": geo.get("country"),
-                "province": geo.get("province"),
-                "city": geo.get("city"),
-                "citycode": geo.get("citycode"),
-                "district": geo.get("district"),
-                "street": geo.get("street"),
-                "number": geo.get("number"),
-                "adcode": geo.get("adcode"),
-                "location": geo.get("location"),
-                "level": geo.get("level")
-            })
-        return {"return": results}
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-@mcp.tool()
-def maps_ip_location(ip: str) -> Dict[str, Any]:
-    """IP 定位根据用户输入的 IP 地址，定位 IP 的所在位置"""
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/ip",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "ip": ip
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data["status"] != "1":
-            return {"error": f"IP Location failed: {data.get('info') or data.get('infocode')}"}
-
-        return {
-            "province": data.get("province"),
-            "city": data.get("city"),
-            "adcode": data.get("adcode"),
-            "rectangle": data.get("rectangle")
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-@mcp.tool()
-def maps_weather(city: str) -> Dict[str, Any]:
-    """根据城市名称或者标准adcode查询指定城市的天气"""
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/weather/weatherInfo",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "city": city,
-                "extensions": "all"
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data["status"] != "1":
-            return {"error": f"Get weather failed: {data.get('info') or data.get('infocode')}"}
-
-        forecasts = data.get("forecasts", [])
-        if not forecasts:
-            return {"error": "No forecast data available"}
-
-        return {
-            "city": forecasts[0]["city"],
-            "forecasts": forecasts[0]["casts"]
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-@mcp.tool()
-def maps_bicycling_by_address(origin_address: str, destination_address: str, origin_city: Optional[str] = None, destination_city: Optional[str] = None) -> Dict[str, Any]:
-    """Plans a bicycle route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.
-
-    IMPORTANT: All addresses and city names MUST be in Chinese (中文). English input will
-    produce wrong results or errors. Example: origin_address="北京市朝阳区阜通东大街6号"
+    All inputs MUST be in Chinese. Example: origin="团结湖地铁站", destination="北京第八十中学望京校区", city="北京"
 
     Args:
-        origin_address (str): Starting point address in Chinese (e.g. "北京市朝阳区阜通东大街6号")
-        destination_address (str): Ending point address in Chinese (e.g. "北京市海淀区上地十街10号")
-        origin_city (Optional[str]): City name in Chinese for the origin (e.g. "北京")
-        destination_city (Optional[str]): City name in Chinese for the destination (e.g. "北京")
-
-    Returns:
-        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.
-        Considers bridges, one-way streets, and road closures. Supports routes up to 500km.
+        origin: Starting location name/address in Chinese
+        destination: Ending location name/address in Chinese
+        city: City name in Chinese (default: 北京). Used for both origin and destination; for cross-city trips pass the origin city.
     """
+    geo = _geocode_pair(origin, destination, city, city)
+    if isinstance(geo, dict):
+        return geo
+    origin_loc, dest_loc, addresses = geo
+
     try:
-        # Convert origin address to coordinates
-        origin_result = maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
+        resp = requests.get("https://restapi.amap.com/v3/direction/transit/integrated", params={
+            "key": AMAP_MAPS_API_KEY, "origin": origin_loc, "destination": dest_loc,
+            "city": city, "cityd": city,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
+    if data.get("status") != "1":
+        return {"error": f"Transit API: {data.get('info') or data.get('infocode')}"}
 
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
+    route = data.get("route")
+    if not isinstance(route, dict):
+        return {"error": "No route data"}
 
-        # Convert destination address to coordinates
-        destination_result = maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
+    plans = []
+    for t in (route.get("transits") or []):
+        if not isinstance(t, dict):
+            continue
+        segments = []
+        for seg in (t.get("segments") or []):
+            if not isinstance(seg, dict):
+                continue
+            s = {}
+            # walking
+            w = seg.get("walking")
+            if isinstance(w, dict) and w.get("distance"):
+                s["walk"] = {"distance": w.get("distance"), "duration": _duration_str(w.get("duration"))}
+            # bus/subway
+            bus = seg.get("bus")
+            if isinstance(bus, dict):
+                for bl in (bus.get("buslines") or []):
+                    if not isinstance(bl, dict):
+                        continue
+                    dep = bl.get("departure_stop") or {}
+                    arr = bl.get("arrival_stop") or {}
+                    s["line"] = {
+                        "name": bl.get("name"),
+                        "from": dep.get("name") if isinstance(dep, dict) else None,
+                        "to": arr.get("name") if isinstance(arr, dict) else None,
+                        "stops": bl.get("via_num"),
+                        "duration": _duration_str(bl.get("duration")),
+                    }
+                    break  # first busline option is enough
+            # railway
+            rail = seg.get("railway")
+            if isinstance(rail, dict) and rail.get("name"):
+                s["railway"] = {"name": rail.get("name"), "trip": rail.get("trip")}
+            # entrance/exit
+            ent = seg.get("entrance")
+            if isinstance(ent, dict) and ent.get("name"):
+                s["entrance"] = ent["name"]
+            ext = seg.get("exit")
+            if isinstance(ext, dict) and ext.get("name"):
+                s["exit"] = ext["name"]
+            if s:
+                segments.append(s)
 
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
+        plans.append({
+            "duration": _duration_str(t.get("duration")),
+            "walking_distance": t.get("walking_distance"),
+            "segments": segments,
+        })
 
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
+    return {"addresses": addresses, "distance": route.get("distance"), "plans": plans}
 
-        # Use the coordinates to plan the bicycle route
-        route_result = maps_bicycling_by_coordinates(origin_location, destination_location)
-
-        # Add address information to the result
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location
-                }
-            }
-
-        return route_result
-    except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
 
 @mcp.tool()
-def maps_bicycling_by_coordinates(origin_coordinates: str, destination_coordinates: str) -> Dict[str, Any]:
-    """Plans a bicycle route between two coordinates.
+def route_drive(origin: str, destination: str, origin_city: str = "北京", destination_city: str = "北京") -> Dict[str, Any]:
+    """Plan a driving route between two places.
+
+    All inputs MUST be in Chinese.
 
     Args:
-        origin_coordinates (str): Starting point coordinates in the format "longitude,latitude" (e.g. "116.434307,39.90909")
-        destination_coordinates (str): Ending point coordinates in the format "longitude,latitude" (e.g. "116.434307,39.90909")
-
-    Returns:
-        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.
-        Considers bridges, one-way streets, and road closures. Supports routes up to 500km.
+        origin: Starting location name/address in Chinese
+        destination: Ending location name/address in Chinese
+        origin_city: Origin city in Chinese (default: 北京)
+        destination_city: Destination city in Chinese (default: 北京)
     """
+    geo = _geocode_pair(origin, destination, origin_city, destination_city)
+    if isinstance(geo, dict):
+        return geo
+    origin_loc, dest_loc, addresses = geo
+
     try:
-        response = requests.get(
-            "https://restapi.amap.com/v4/direction/bicycling",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "origin": origin_coordinates,
-                "destination": destination_coordinates
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
+        resp = requests.get("https://restapi.amap.com/v3/direction/driving", params={
+            "key": AMAP_MAPS_API_KEY, "origin": origin_loc, "destination": dest_loc,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
-        if data.get("errcode") != 0:
-            return {"error": f"Direction bicycling failed: {data.get('info') or data.get('infocode')}"}
+    if data["status"] != "1":
+        return {"error": f"Driving API: {data.get('info') or data.get('infocode')}"}
 
-        paths = []
-        for path in data["data"]["paths"]:
-            steps = []
-            for step in path["steps"]:
-                steps.append({
-                    "instruction": step.get("instruction"),
-                    "road": step.get("road"),
-                    "distance": step.get("distance"),
-                    "orientation": step.get("orientation"),
-                    "duration": step.get("duration")
-                })
-            duration_sec = path.get("duration")
-            try:
-                mins = int(duration_sec) // 60
-                duration_display = f"{mins} minutes"
-            except (TypeError, ValueError):
-                duration_display = duration_sec
-            paths.append({
-                "distance": path.get("distance"),
-                "duration_seconds": duration_sec,
-                "duration": duration_display,
-                "steps": steps
-            })
+    paths = []
+    for p in data["route"]["paths"]:
+        steps = [{"instruction": s.get("instruction"), "road": s.get("road"), "distance": s.get("distance")} for s in p.get("steps", [])]
+        paths.append({"distance": p.get("distance"), "duration": _duration_str(p.get("duration")), "steps": steps})
 
-        return {
-            "data": {
-                "origin": data["data"]["origin"],
-                "destination": data["data"]["destination"],
-                "paths": paths
-            }
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
+    return {"addresses": addresses, "paths": paths}
+
 
 @mcp.tool()
-def maps_direction_walking_by_address(origin_address: str, destination_address: str, origin_city: Optional[str] = None, destination_city: Optional[str] = None) -> Dict[str, Any]:
-    """Plans a walking route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.
+def route_walk(origin: str, destination: str, origin_city: str = "北京", destination_city: str = "北京") -> Dict[str, Any]:
+    """Plan a walking route between two places (up to 100km).
 
-    IMPORTANT: All addresses and city names MUST be in Chinese (中文). English input will
-    produce wrong results or errors. Example: origin_address="北京市朝阳区阜通东大街6号"
+    All inputs MUST be in Chinese.
 
     Args:
-        origin_address (str): Starting point address in Chinese (e.g. "北京市朝阳区阜通东大街6号")
-        destination_address (str): Ending point address in Chinese (e.g. "北京市海淀区上地十街10号")
-        origin_city (Optional[str]): City name in Chinese for the origin (e.g. "北京")
-        destination_city (Optional[str]): City name in Chinese for the destination (e.g. "北京")
-
-    Returns:
-        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.
-        Supports routes up to 100km.
+        origin: Starting location name/address in Chinese
+        destination: Ending location name/address in Chinese
+        origin_city: Origin city in Chinese (default: 北京)
+        destination_city: Destination city in Chinese (default: 北京)
     """
+    geo = _geocode_pair(origin, destination, origin_city, destination_city)
+    if isinstance(geo, dict):
+        return geo
+    origin_loc, dest_loc, addresses = geo
+
     try:
-        # Convert origin address to coordinates
-        origin_result = maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
+        resp = requests.get("https://restapi.amap.com/v3/direction/walking", params={
+            "key": AMAP_MAPS_API_KEY, "origin": origin_loc, "destination": dest_loc,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
+    if data["status"] != "1":
+        return {"error": f"Walking API: {data.get('info') or data.get('infocode')}"}
 
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
+    paths = []
+    for p in data["route"]["paths"]:
+        steps = [{"instruction": s.get("instruction"), "road": s.get("road"), "distance": s.get("distance")} for s in p.get("steps", [])]
+        paths.append({"distance": p.get("distance"), "duration": _duration_str(p.get("duration")), "steps": steps})
 
-        # Convert destination address to coordinates
-        destination_result = maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
+    return {"addresses": addresses, "paths": paths}
 
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
-
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
-
-        # Use the coordinates to plan the walking route
-        route_result = maps_direction_walking_by_coordinates(origin_location, destination_location)
-
-        # Add address information to the result
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location
-                }
-            }
-
-        return route_result
-    except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
 
 @mcp.tool()
-def maps_direction_walking_by_coordinates(origin: str, destination: str) -> Dict[str, Any]:
-    """步行路径规划 API 可以根据输入起点终点经纬度坐标规划100km 以内的步行通勤方案，并且返回通勤方案的数据
+def route_bike(origin: str, destination: str, origin_city: str = "北京", destination_city: str = "北京") -> Dict[str, Any]:
+    """Plan a bicycle route between two places (up to 500km).
+
+    All inputs MUST be in Chinese.
 
     Args:
-        origin (str): 起点经纬度坐标，格式为"经度,纬度" (例如："116.434307,39.90909")
-        destination (str): 终点经纬度坐标，格式为"经度,纬度" (例如："116.434307,39.90909")
-
-    Returns:
-        Dict[str, Any]: 包含距离、时长和详细导航信息的路线数据
+        origin: Starting location name/address in Chinese
+        destination: Ending location name/address in Chinese
+        origin_city: Origin city in Chinese (default: 北京)
+        destination_city: Destination city in Chinese (default: 北京)
     """
+    geo = _geocode_pair(origin, destination, origin_city, destination_city)
+    if isinstance(geo, dict):
+        return geo
+    origin_loc, dest_loc, addresses = geo
+
     try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/direction/walking",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "origin": origin,
-                "destination": destination
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
+        resp = requests.get("https://restapi.amap.com/v4/direction/bicycling", params={
+            "key": AMAP_MAPS_API_KEY, "origin": origin_loc, "destination": dest_loc,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
-        if data["status"] != "1":
-            return {"error": f"Direction Walking failed: {data.get('info') or data.get('infocode')}"}
+    if data.get("errcode") != 0:
+        return {"error": f"Bicycling API: {data.get('info') or data.get('infocode')}"}
 
-        paths = []
-        for path in data["route"]["paths"]:
-            steps = []
-            for step in path["steps"]:
-                steps.append({
-                    "instruction": step.get("instruction"),
-                    "road": step.get("road"),
-                    "distance": step.get("distance"),
-                    "orientation": step.get("orientation"),
-                    "duration": step.get("duration")
-                })
-            duration_sec = path.get("duration")
-            try:
-                mins = int(duration_sec) // 60
-                duration_display = f"{mins} minutes"
-            except (TypeError, ValueError):
-                duration_display = duration_sec
-            paths.append({
-                "distance": path.get("distance"),
-                "duration_seconds": duration_sec,
-                "duration": duration_display,
-                "steps": steps
-            })
+    paths = []
+    for p in data["data"]["paths"]:
+        steps = [{"instruction": s.get("instruction"), "road": s.get("road"), "distance": s.get("distance")} for s in p.get("steps", [])]
+        paths.append({"distance": p.get("distance"), "duration": _duration_str(p.get("duration")), "steps": steps})
 
-        return {
-            "route": {
-                "origin": data["route"]["origin"],
-                "destination": data["route"]["destination"],
-                "paths": paths
-            }
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
+    return {"addresses": addresses, "paths": paths}
+
+
+# ── POI search tools ─────────────────────────────────────────────────
 
 @mcp.tool()
-def maps_direction_driving_by_address(origin_address: str, destination_address: str, origin_city: Optional[str] = None, destination_city: Optional[str] = None) -> Dict[str, Any]:
-    """Plans a driving route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.
-
-    IMPORTANT: All addresses and city names MUST be in Chinese (中文). English input will
-    produce wrong results or errors. Example: origin_address="北京市朝阳区阜通东大街6号"
+def poi_search(keywords: str, city: str = "", citylimit: bool = False) -> Dict[str, Any]:
+    """Search for places/POIs by keyword (restaurants, hospitals, schools, etc).
 
     Args:
-        origin_address (str): Starting point address in Chinese (e.g. "北京市朝阳区阜通东大街6号")
-        destination_address (str): Ending point address in Chinese (e.g. "北京市海淀区上地十街10号")
-        origin_city (Optional[str]): City name in Chinese for the origin (e.g. "北京")
-        destination_city (Optional[str]): City name in Chinese for the destination (e.g. "北京")
-
-    Returns:
-        Dict[str, Any]: Route information including distance, duration, and turn-by-turn instructions.
-        Considers traffic conditions and road restrictions.
+        keywords: Search keywords (Chinese recommended, e.g. "火锅", "北京大学")
+        city: Limit search to this city (Chinese name or adcode)
+        citylimit: If true, only return results within the specified city
     """
     try:
-        # Convert origin address to coordinates
-        origin_result = maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
+        resp = requests.get("https://restapi.amap.com/v3/place/text", params={
+            "key": AMAP_MAPS_API_KEY, "keywords": keywords,
+            "city": city, "citylimit": "true" if citylimit else "false",
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
+    if data["status"] != "1":
+        return {"error": f"Search API: {data.get('info') or data.get('infocode')}"}
 
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
+    return {
+        "pois": [{"name": p.get("name"), "address": p.get("address"), "location": p.get("location"), "type": p.get("type"), "id": p.get("id")} for p in data.get("pois", [])],
+    }
 
-        # Convert destination address to coordinates
-        destination_result = maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
-
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
-
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
-
-        # Use the coordinates to plan the driving route
-        route_result = maps_direction_driving_by_coordinates(origin_location, destination_location)
-
-        # Add address information to the result
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location
-                }
-            }
-
-        return route_result
-    except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
 
 @mcp.tool()
-def maps_direction_driving_by_coordinates(origin: str, destination: str) -> Dict[str, Any]:
-    """驾车路径规划 API 可以根据用户起终点经纬度坐标规划以小客车、轿车通勤出行的方案，并且返回通勤方案的数据
+def poi_nearby(location: str, radius: str = "1000", keywords: str = "") -> Dict[str, Any]:
+    """Search for POIs near a coordinate point.
 
     Args:
-        origin (str): 起点经纬度坐标，格式为"经度,纬度" (例如："116.434307,39.90909")
-        destination (str): 终点经纬度坐标，格式为"经度,纬度" (例如："116.434307,39.90909")
-
-    Returns:
-        Dict[str, Any]: 包含距离、时长和详细导航信息的路线数据
+        location: Center point as "longitude,latitude" (e.g. "116.460186,39.933734")
+        radius: Search radius in meters (default 1000)
+        keywords: Optional filter keywords
     """
     try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/direction/driving",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "origin": origin,
-                "destination": destination
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
+        resp = requests.get("https://restapi.amap.com/v3/place/around", params={
+            "key": AMAP_MAPS_API_KEY, "location": location,
+            "radius": radius, "keywords": keywords,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
-        if data["status"] != "1":
-            return {"error": f"Direction Driving failed: {data.get('info') or data.get('infocode')}"}
+    if data["status"] != "1":
+        return {"error": f"Nearby API: {data.get('info') or data.get('infocode')}"}
 
-        paths = []
-        for path in data["route"]["paths"]:
-            steps = []
-            for step in path["steps"]:
-                steps.append({
-                    "instruction": step.get("instruction"),
-                    "road": step.get("road"),
-                    "distance": step.get("distance"),
-                    "orientation": step.get("orientation"),
-                    "duration": step.get("duration")
-                })
-            duration_sec = path.get("duration")
-            try:
-                mins = int(duration_sec) // 60
-                duration_display = f"{mins} minutes"
-            except (TypeError, ValueError):
-                duration_display = duration_sec
-            paths.append({
-                "path": path.get("path"),
-                "distance": path.get("distance"),
-                "duration_seconds": duration_sec,
-                "duration": duration_display,
-                "steps": steps
-            })
+    return {
+        "pois": [{"name": p.get("name"), "address": p.get("address"), "location": p.get("location"), "type": p.get("type"), "id": p.get("id")} for p in data.get("pois", [])],
+    }
 
-        return {
-            "route": {
-                "origin": data["route"]["origin"],
-                "destination": data["route"]["destination"],
-                "paths": paths
-            }
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
 
 @mcp.tool()
-def maps_direction_transit_integrated_by_address(origin_address: str, destination_address: str, origin_city: str, destination_city: str) -> Dict[str, Any]:
-    """Plans a public transit route between two locations using addresses. Unless you have a specific reason to use coordinates, it's recommended to use this tool.
-
-    IMPORTANT: All addresses and city names MUST be in Chinese (中文). English input will
-    produce wrong results or errors. Example: origin_address="团结湖地铁站", origin_city="北京"
+def poi_detail(poi_id: str) -> Dict[str, Any]:
+    """Get detailed info for a POI by its ID (from poi_search or poi_nearby results).
 
     Args:
-        origin_address (str): Starting point address in Chinese (e.g. "北京市朝阳区阜通东大街6号")
-        destination_address (str): Ending point address in Chinese (e.g. "北京市海淀区上地十街10号")
-        origin_city (str): City name in Chinese for the origin (e.g. "北京", required for cross-city transit)
-        destination_city (str): City name in Chinese for the destination (e.g. "北京", required for cross-city transit)
-
-    Returns:
-        Dict[str, Any]: Route information including distance, duration, and detailed transit instructions.
-        Considers various public transit options including buses, subways, and trains.
+        poi_id: The POI ID string
     """
     try:
-        # Convert origin address to coordinates
-        origin_result = maps_geo(origin_address, origin_city)
-        if "error" in origin_result:
-            return {"error": f"Failed to geocode origin address: {origin_result['error']}"}
+        resp = requests.get("https://restapi.amap.com/v3/place/detail", params={
+            "key": AMAP_MAPS_API_KEY, "id": poi_id,
+        })
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        return {"error": str(e)}
 
-        if not origin_result.get("return") or not origin_result["return"]:
-            return {"error": "No geocoding results found for origin address"}
+    if data["status"] != "1":
+        return {"error": f"Detail API: {data.get('info') or data.get('infocode')}"}
+    if not data.get("pois"):
+        return {"error": "POI not found"}
 
-        origin_location = origin_result["return"][0].get("location")
-        if not origin_location:
-            return {"error": "Could not extract coordinates from origin geocoding result"}
+    poi = data["pois"][0]
+    result = {
+        "name": poi.get("name"),
+        "address": poi.get("address"),
+        "location": poi.get("location"),
+        "city": poi.get("cityname"),
+        "type": poi.get("type"),
+        "tel": poi.get("tel"),
+        "business_area": poi.get("business_area"),
+    }
+    if poi.get("biz_ext"):
+        result["extra"] = poi["biz_ext"]
+    return result
 
-        # Convert destination address to coordinates
-        destination_result = maps_geo(destination_address, destination_city)
-        if "error" in destination_result:
-            return {"error": f"Failed to geocode destination address: {destination_result['error']}"}
-
-        if not destination_result.get("return") or not destination_result["return"]:
-            return {"error": "No geocoding results found for destination address"}
-
-        destination_location = destination_result["return"][0].get("location")
-        if not destination_location:
-            return {"error": "Could not extract coordinates from destination geocoding result"}
-
-        # Use the coordinates to plan the transit route
-        route_result = maps_direction_transit_integrated_by_coordinates(origin_location, destination_location, origin_city, destination_city)
-
-        # Add address information to the result
-        if "error" not in route_result:
-            route_result["addresses"] = {
-                "origin": {
-                    "address": origin_address,
-                    "coordinates": origin_location
-                },
-                "destination": {
-                    "address": destination_address,
-                    "coordinates": destination_location
-                }
-            }
-
-        return route_result
-    except Exception as e:
-        return {"error": f"Route planning failed: {str(e)}"}
-
-@mcp.tool()
-def maps_direction_transit_integrated_by_coordinates(origin: str, destination: str, city: str, cityd: str) -> Dict[str, Any]:
-    """根据用户起终点经纬度坐标规划综合各类公共（火车、公交、地铁）交通方式的通勤方案，并且返回通勤方案的数据，跨城场景下必须传起点城市与终点城市
-
-    Args:
-        origin (str): 起点经纬度坐标，格式为"经度,纬度" (例如："116.434307,39.90909")
-        destination (str): 终点经纬度坐标，格式为"经度,纬度" (例如："116.434307,39.90909")
-        city (str): 起点城市名称
-        cityd (str): 终点城市名称
-
-    Returns:
-        Dict[str, Any]: 包含距离、时长和详细公共交通信息的路线数据
-    """
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/direction/transit/integrated",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "origin": origin,
-                "destination": destination,
-                "city": city,
-                "cityd": cityd
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("status") != "1":
-            return {"error": f"Direction Transit Integrated failed: {data.get('info') or data.get('infocode')}"}
-
-        # Safe handling for route data - it might be a list or missing
-        route_data = data.get("route")
-        if not isinstance(route_data, dict):
-            return {"error": "No route data available"}
-
-        transits = []
-        transits_data = route_data.get("transits")
-        if isinstance(transits_data, list):
-            for transit in transits_data:
-                # Ensure transit is a dict
-                if not isinstance(transit, dict):
-                    continue
-
-                segments = []
-                segments_data = transit.get("segments")
-                if isinstance(segments_data, list):
-                    for segment in segments_data:
-                        # Ensure segment is a dict
-                        if not isinstance(segment, dict):
-                            continue
-
-                        # Safe handling for walking data
-                        walking_data = segment.get("walking")
-                        if not isinstance(walking_data, dict):
-                            walking_data = {}
-
-                        walking_steps = []
-                        steps_data = walking_data.get("steps")
-                        if isinstance(steps_data, list):
-                            for step in steps_data:
-                                if isinstance(step, dict):
-                                    walking_steps.append({
-                                        "instruction": step.get("instruction"),
-                                        "road": step.get("road"),
-                                        "distance": step.get("distance"),
-                                        "action": step.get("action"),
-                                        "assistant_action": step.get("assistant_action")
-                                    })
-
-                        # Safe handling for bus data
-                        bus_data = segment.get("bus")
-                        if not isinstance(bus_data, dict):
-                            bus_data = {}
-
-                        buslines = []
-                        buslines_data = bus_data.get("buslines")
-                        if isinstance(buslines_data, list):
-                            for busline in buslines_data:
-                                # Ensure busline is a dict
-                                if not isinstance(busline, dict):
-                                    continue
-
-                                via_stops = []
-                                via_stops_data = busline.get("via_stops")
-                                if isinstance(via_stops_data, list):
-                                    for stop in via_stops_data:
-                                        if isinstance(stop, dict):
-                                            via_stops.append({"name": stop.get("name")})
-
-                                dep_stop = busline.get("departure_stop")
-                                if not isinstance(dep_stop, dict):
-                                    dep_stop = {}
-
-                                arr_stop = busline.get("arrival_stop")
-                                if not isinstance(arr_stop, dict):
-                                    arr_stop = {}
-
-                                buslines.append({
-                                    "name": busline.get("name"),
-                                    "departure_stop": {"name": dep_stop.get("name")},
-                                    "arrival_stop": {"name": arr_stop.get("name")},
-                                    "distance": busline.get("distance"),
-                                    "duration": busline.get("duration"),
-                                    "via_stops": via_stops
-                                })
-
-                        # Safe handling for other optional fields
-                        entrance_data = segment.get("entrance")
-                        if not isinstance(entrance_data, dict):
-                            entrance_data = {}
-
-                        exit_data = segment.get("exit")
-                        if not isinstance(exit_data, dict):
-                            exit_data = {}
-
-                        railway_data = segment.get("railway")
-                        if not isinstance(railway_data, dict):
-                            railway_data = {}
-
-                        segments.append({
-                            "walking": {
-                                "origin": walking_data.get("origin"),
-                                "destination": walking_data.get("destination"),
-                                "distance": walking_data.get("distance"),
-                                "duration": walking_data.get("duration"),
-                                "steps": walking_steps
-                            },
-                            "bus": {"buslines": buslines},
-                            "entrance": {"name": entrance_data.get("name")},
-                            "exit": {"name": exit_data.get("name")},
-                            "railway": {
-                                "name": railway_data.get("name"),
-                                "trip": railway_data.get("trip")
-                            }
-                        })
-
-                duration_sec = transit.get("duration")
-                try:
-                    mins = int(duration_sec) // 60
-                    duration_display = f"{mins} minutes"
-                except (TypeError, ValueError):
-                    duration_display = duration_sec
-
-                transits.append({
-                    "duration_seconds": duration_sec,
-                    "duration": duration_display,
-                    "walking_distance": transit.get("walking_distance"),
-                    "segments": segments
-                })
-
-        return {
-            "route": {
-                "origin": route_data.get("origin"),
-                "destination": route_data.get("destination"),
-                "distance": route_data.get("distance"),
-                "transits": transits
-            }
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-@mcp.tool()
-def maps_distance(origins: str, destination: str, type: str = "1") -> Dict[str, Any]:
-    """测量两个经纬度坐标之间的距离,支持驾车、步行以及球面距离测量"""
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/distance",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "origins": origins,
-                "destination": destination,
-                "type": type
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data["status"] != "1":
-            return {"error": f"Direction Distance failed: {data.get('info') or data.get('infocode')}"}
-
-        results = []
-        for result in data["results"]:
-            results.append({
-                "origin_id": result.get("origin_id"),
-                "dest_id": result.get("dest_id"),
-                "distance": result.get("distance"),
-                "duration": result.get("duration")
-            })
-
-        return {"results": results}
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-@mcp.tool()
-def maps_text_search(keywords: str, city: str = "", citylimit: str = "false") -> Dict[str, Any]:
-    """关键词搜索 API 根据用户输入的关键字进行 POI 搜索，并返回相关的信息"""
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/place/text",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "keywords": keywords,
-                "city": city,
-                "citylimit": citylimit
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data["status"] != "1":
-            return {"error": f"Text Search failed: {data.get('info') or data.get('infocode')}"}
-
-        suggestion_cities = []
-        if data.get("suggestion", {}).get("cities"):
-            for city in data["suggestion"]["cities"]:
-                suggestion_cities.append({"name": city.get("name")})
-
-        pois = []
-        for poi in data.get("pois", []):
-            pois.append({
-                "id": poi.get("id"),
-                "name": poi.get("name"),
-                "address": poi.get("address"),
-                "typecode": poi.get("typecode")
-            })
-
-        return {
-            "suggestion": {
-                "keywords": data.get("suggestion", {}).get("keywords"),
-                "cities": suggestion_cities
-            },
-            "pois": pois
-        }
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-@mcp.tool()
-def maps_around_search(location: str, radius: str = "1000", keywords: str = "") -> Dict[str, Any]:
-    """周边搜，根据用户传入关键词以及坐标location，搜索出radius半径范围的POI"""
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/place/around",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "location": location,
-                "radius": radius,
-                "keywords": keywords
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data["status"] != "1":
-            return {"error": f"Around Search failed: {data.get('info') or data.get('infocode')}"}
-
-        pois = []
-        for poi in data.get("pois", []):
-            pois.append({
-                "id": poi.get("id"),
-                "name": poi.get("name"),
-                "address": poi.get("address"),
-                "typecode": poi.get("typecode")
-            })
-
-        return {"pois": pois}
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
-
-@mcp.tool()
-def maps_search_detail(id: str) -> Dict[str, Any]:
-    """查询关键词搜或者周边搜获取到的POI ID的详细信息"""
-    try:
-        response = requests.get(
-            "https://restapi.amap.com/v3/place/detail",
-            params={
-                "key": AMAP_MAPS_API_KEY,
-                "id": id
-            }
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        if data["status"] != "1":
-            return {"error": f"Get poi detail failed: {data.get('info') or data.get('infocode')}"}
-
-        if not data.get("pois"):
-            return {"error": "No POI found"}
-
-        poi = data["pois"][0]
-        result = {
-            "id": poi.get("id"),
-            "name": poi.get("name"),
-            "location": poi.get("location"),
-            "address": poi.get("address"),
-            "business_area": poi.get("business_area"),
-            "city": poi.get("cityname"),
-            "type": poi.get("type"),
-            "alias": poi.get("alias")
-        }
-
-        # Add biz_ext data if available
-        if poi.get("biz_ext"):
-            result.update(poi["biz_ext"])
-
-        return result
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Request failed: {str(e)}"}
 
 if __name__ == "__main__":
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description="Amap MCP Server")
-    parser.add_argument('transport', nargs='?', default='stdio', choices=['stdio', 'sse', 'streamable-http'],
-                        help='Transport type (stdio, sse, or streamable-http)')
+    parser.add_argument("transport", nargs="?", default="stdio", choices=["stdio", "sse", "streamable-http"])
     args = parser.parse_args()
-
-    # Run the MCP server with the specified transport
     mcp.run(transport=args.transport)
